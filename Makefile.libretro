@@ -67,6 +67,12 @@ ifeq ($(platform), unix)
 	TARGET := $(TARGET_NAME)_libretro.so
 	fpic := -fPIC
     WANT_32BPP := 1
+    # [AUTOLOAD-PATCH] _GNU_SOURCE exposes Dl_info/dladdr() in <dlfcn.h>;
+    # -ldl links libdl which provides dladdr() at runtime. Both are needed
+    # for the auto-load save-state block in libretro.c to find the core's
+    # own .so path at runtime (dladdr on the function address).
+    CFLAGS += -D_GNU_SOURCE
+    LDFLAGS += -ldl
 ifneq ($(findstring SunOS,$(shell uname -a)),)
 	CC = gcc
 	SHARED := -shared -z defs

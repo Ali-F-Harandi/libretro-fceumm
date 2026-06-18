@@ -3740,44 +3740,47 @@ static void autoload_try_load_state(void)
       free(buf);
 }
 
-/* ---- Config-driven cheats (NES internal RAM) ----------------------- *
- * Two flavours of cheat, both configured in the same .cfg file as the
- * auto-load feature (under a "[cheats]" section):
+/* ---- Per-ROM cheats (NES internal RAM) ------------------------------ *
+ * Second-generation design: instead of an inline [cheats] section in the
+ * core's main .cfg, the user sets a "cheats_path" in the main .cfg that
+ * points to a folder. Inside that folder, per-ROM cheat files live, named
+ * "<rom-basename>.cfg" - the same basename-matching logic used by the
+ * auto-load save-state feature.
  *
- *   0x000e = 0x3f           <-- oneshot: applied once when Num2 is pressed
- *   0x0016 = 0x10, const    <-- const:  applied every frame (sticky) until
- *                                           Num0 is pressed to toggle it off
+ * Cheat file format (one cheat per line):
  *
- * Address range: 0x0000 - 0x07FF (NES internal 2KB work RAM only).
+ *    0x0429 = 0x4                  oneshot (Num2)
+ *    0x0009 = 0xfa [const]         const   (every frame; Num0 toggles)
+ *    0x0439 = 0x10 [auto]          auto    (applied automatically on ROM load)
+ *    0x0a39 = 0x05 [const] [auto]  const + auto (both behaviours)
  *
- * Hotkeys:
- *   Numpad 2  - apply all oneshot cheats once (no effect if list is empty)
- *   Numpad 0  - toggle "const cheats enabled" flag (default: on at boot)
+ * Flags inside [] are whitespace-separated and order-independent.
+ * Lines starting with # or ; are comments.
  *
- * State machine:
- *   - const cheats, when enabled, are written to RAM[] every frame AFTER
- *     FCEUI_Emulate(), so the game's own writes to those addresses are
- *     immediately overwritten. This is what makes them "sticky".
- *   - oneshot cheats are written exactly once, on the frame Num2 is pressed.
- *     The game is free to overwrite them afterwards.
- *   - Num0 toggles the global `cheats_const_enabled` flag. When off, the
- *     per-frame const writes are skipped entirely (the game can change the
- *     bytes freely). Toggling back on resumes the writes immediately.
+ * Hotkeys (same as v1):
+ *   Numpad 0  - toggle const cheats on/off (default: on)
+ *   Numpad 2  - apply oneshot cheats once
  *
- * Cheats are re-read from the .cfg every time a new ROM loads
- * (cheats_pending_reload flag set in retro_load_game).
+ * "auto" flag means: apply this cheat automatically when the ROM loads
+ * (after the auto-load save state, if any). For an "auto" cheat that is
+ * also "const", the const writes begin immediately on the next frame
+ * (cheats_const_enabled defaults to true). For "auto" without "const",
+ * the value is written once at ROM load time and the game is free to
+ * change it afterwards (just like a Num2 press, but automatic).
  *
- * All activity is logged via the same autoload_logf() used by the
- * auto-load feature, so it ends up in autoload.log next to the core.       */
+ * All activity is logged via autoload_logf() so it ends up in autoload.log.
+ *                                                                   */
 
-#define CHEATS_MAX_ENTRIES  64        /* max cheat lines per .cfg          */
-#define CHEATS_RAM_SIZE     0x800     /* NES internal RAM size (2KB)       */
+#define CHEATS_MAX_ENTRIES  64        /* max cheat lines per ROM .cfg    */
+#define CHEATS_RAM_SIZE     0x800     /* NES internal RAM size (2KB)     */
+#define CHEATS_MAX_PATHS    16        /* max cheats_path lines in main cfg */
 
 typedef struct
 {
    uint16_t addr;          /* NES RAM address, 0x0000 - 0x07FF           */
    uint8_t  val;           /* value to write                              */
    bool     is_const;      /* true = apply every frame; false = oneshot   */
+   bool     is_auto;       /* true = apply automatically on ROM load      */
 } cheat_entry;
 
 static cheat_entry cheats_list[CHEATS_MAX_ENTRIES];
@@ -3786,145 +3789,211 @@ static bool        cheats_const_enabled  = true;   /* Num0 toggles this     */
 static bool        cheats_oneshot_pending = false;  /* Num2 sets this        */
 static bool        cheats_pending_reload = true;    /* set true on ROM load  */
 
-/* Parse the [cheats] section of the .cfg file.
- *
- * Each non-comment, non-empty line inside [cheats] is one of:
- *    0x000e = 0x3f              oneshot
- *    0x000e = 0x3f, const       sticky (applied every frame)
- *    0x000e = 0x3f,const        (whitespace optional)
- *
- * Lines outside [cheats] are ignored (they belong to the auto-load section).
- * Returns the number of cheats loaded, or -1 on parse error.
- */
-static int cheats_load_from_cfg(const char *cfg_path)
+/* cheats_path entries read from the main .cfg. Same multi-path scheme as
+ * save_path: try each in order, use the first folder that contains the
+ * matching <rom-basename>.cfg file. */
+static char cheats_paths[CHEATS_MAX_PATHS][AUTOLOAD_MAX_PATH];
+static int  cheats_paths_count = 0;
+
+/* ---- Parse the main .cfg for cheats_path = ... lines ------------------ *
+ * Reuses autoload_read_config()'s trimmer but only pulls cheats_path lines.
+ * This is called from cheats_maybe_reload() the first time cheats are
+ * needed (lazy init), then cached. */
+static void cheats_read_paths_from_cfg(const char *cfg_path)
 {
    FILE *fp;
    char  line[1024];
-   bool  in_cheats_section = false;
-   int   loaded            = 0;
+
+   cheats_paths_count = 0;
+   fp = fopen(cfg_path, "r");
+   if (!fp)
+      return;
+
+   while (fgets(line, sizeof(line), fp) && cheats_paths_count < CHEATS_MAX_PATHS)
+   {
+      char *p, *eq;
+      autoload_trim(line);
+      if (line[0] == '\0' || line[0] == '#' || line[0] == ';' || line[0] == '[')
+         continue;
+      /* look for "cheats_path" key */
+      if (strncmp(line, "cheats_path", 11) != 0)
+         continue;
+      eq = strchr(line, '=');
+      if (!eq)
+         continue;
+      p = eq + 1;
+      while (*p == ' ' || *p == '\t') p++;
+      strncpy(cheats_paths[cheats_paths_count], p, AUTOLOAD_MAX_PATH - 1);
+      cheats_paths[cheats_paths_count][AUTOLOAD_MAX_PATH - 1] = '\0';
+      cheats_paths_count++;
+   }
+   fclose(fp);
+}
+
+/* ---- Find <rom-basename>.cfg in the first matching cheats_path -------- *
+ * Builds the full path into `out`. Returns true if a candidate file exists,
+ * false otherwise. Mirrors the multi-path search used by the auto-load
+ * save-state logic. */
+static bool cheats_find_rom_cfg(char *out, size_t out_size)
+{
+   int   i;
+   char  rom_base[AUTOLOAD_MAX_PATH];
+   char  rom_dir[AUTOLOAD_MAX_PATH];
+   char *slash, *dot;
+
+   out[0] = '\0';
+   rom_base[0] = '\0';
+
+   /* extract basename without extension from autoload_rom_path */
+   if (autoload_rom_path[0] == '\0')
+      return false;
+
+   /* find last path separator */
+   slash = strrchr(autoload_rom_path, AUTOLOAD_PATH_SEP);
+   strncpy(rom_base, slash ? slash + 1 : autoload_rom_path, sizeof(rom_base) - 1);
+   rom_base[sizeof(rom_base) - 1] = '\0';
+   /* strip extension */
+   dot = strrchr(rom_base, '.');
+   if (dot) *dot = '\0';
+
+   if (rom_base[0] == '\0')
+      return false;
+
+   /* try each cheats_path */
+   for (i = 0; i < cheats_paths_count; i++)
+   {
+      FILE *fp;
+      snprintf(out, out_size, "%s%c%s.cfg",
+               cheats_paths[i], AUTOLOAD_PATH_SEP, rom_base);
+      fp = fopen(out, "r");
+      if (fp)
+      {
+         fclose(fp);
+         return true;
+      }
+   }
+   out[0] = '\0';
+   return false;
+}
+
+/* ---- Parse a single cheat line --------------------------------------- *
+ * Format: 0xADDR = 0xVAL [flag1] [flag2] ...
+ * Flags recognised: const, auto (case-insensitive, order-independent).
+ * Returns true on success, fills *out_entry. */
+static bool cheats_parse_line(const char *line, cheat_entry *out_entry)
+{
+   char  buf[256];
+   char *eq, *p, *endptr;
+   long  addr_l, val_l;
+
+   strlcpy(buf, line, sizeof(buf));
+   autoload_trim(buf);
+
+   eq = strchr(buf, '=');
+   if (!eq)
+      return false;
+
+   *eq = '\0';
+   p = buf;
+   addr_l = strtol(p, &endptr, 0);
+   if (endptr == p || addr_l < 0 || addr_l >= CHEATS_RAM_SIZE)
+      return false;
+
+   /* value side: everything from eq+1 up to the first '[' (or end of line) */
+   p = eq + 1;
+   {
+      char *bracket = strchr(p, '[');
+      char *bracket2;
+      if (bracket) *bracket = '\0';
+      autoload_trim(p);
+      val_l = strtol(p, &endptr, 0);
+      if (endptr == p || val_l < 0 || val_l > 0xFF)
+         return false;
+      /* scan flags in brackets */
+      out_entry->is_const = false;
+      out_entry->is_auto  = false;
+      while (bracket)
+      {
+         bracket2 = strchr(bracket, '[');
+         if (!bracket2) break;
+         {
+            char *close = strchr(bracket2, ']');
+            char  flag[32];
+            size_t flen;
+            if (!close) break;
+            flen = close - bracket2 - 1;
+            if (flen >= sizeof(flag)) flen = sizeof(flag) - 1;
+            memcpy(flag, bracket2 + 1, flen);
+            flag[flen] = '\0';
+            if (AUTOLOAD_STRCASECMP(flag, "const") == 0)
+               out_entry->is_const = true;
+            else if (AUTOLOAD_STRCASECMP(flag, "auto") == 0)
+               out_entry->is_auto = true;
+            bracket = close + 1;
+         }
+      }
+   }
+
+   out_entry->addr = (uint16_t)addr_l;
+   out_entry->val  = (uint8_t)val_l;
+   return true;
+}
+
+/* ---- Load cheats for the current ROM --------------------------------- *
+ * Reads the per-ROM .cfg file, parses each non-comment line, fills
+ * cheats_list[]. Returns the number of cheats loaded. */
+static int cheats_load_for_rom(const char *rom_cfg_path)
+{
+   FILE *fp;
+   char  line[1024];
+   int   loaded = 0;
 
    cheats_count = 0;
    memset(cheats_list, 0, sizeof(cheats_list));
 
-   fp = fopen(cfg_path, "r");
+   fp = fopen(rom_cfg_path, "r");
    if (!fp)
       return -1;
 
    while (fgets(line, sizeof(line), fp))
    {
-      char  *p, *eq, *comma, *endptr;
-      long   addr_l, val_l;
-      bool   is_const = false;
-
-      /* strip trailing whitespace */
+      cheat_entry e;
       autoload_trim(line);
-
-      /* blank or comment */
       if (line[0] == '\0' || line[0] == '#' || line[0] == ';')
          continue;
-
-      /* section markers */
-      if (line[0] == '[')
-      {
-         in_cheats_section = (strstr(line, "[cheats]") != NULL);
-         continue;
-      }
-
-      if (!in_cheats_section)
-         continue;
-
       if (cheats_count >= CHEATS_MAX_ENTRIES)
       {
          autoload_logf("CHEATS        : max %d entries reached, ignoring rest",
                        CHEATS_MAX_ENTRIES);
          break;
       }
-
-      /* expect "0xADDR = 0xVAL[, const]" */
-      eq = strchr(line, '=');
-      if (!eq)
+      if (cheats_parse_line(line, &e))
       {
+         cheats_list[cheats_count++] = e;
+         loaded++;
+         autoload_logf("CHEATS        : loaded 0x%04x = 0x%02x%s%s",
+                       (unsigned)e.addr, (unsigned)e.val,
+                       e.is_const ? " [const]" : "",
+                       e.is_auto  ? " [auto]"  : "");
+      }
+      else
          autoload_logf("CHEATS        : skip malformed line: %s", line);
-         continue;
-      }
-
-      /* split at '=' */
-      *eq = '\0';
-      p = line;
-      addr_l = strtol(p, &endptr, 0);
-      if (endptr == p)
-      {
-         autoload_logf("CHEATS        : skip bad addr: %s", p);
-         continue;
-      }
-
-      /* value side: may have a trailing ", const" */
-      p = eq + 1;
-      comma = strchr(p, ',');
-      if (comma)
-      {
-         *comma = '\0';
-         if (strstr(comma + 1, "const"))
-            is_const = true;
-      }
-      val_l = strtol(p, &endptr, 0);
-      if (endptr == p)
-      {
-         autoload_logf("CHEATS        : skip bad val: %s", p);
-         continue;
-      }
-
-      /* validate address range (NES internal RAM only) */
-      if (addr_l < 0 || addr_l >= CHEATS_RAM_SIZE)
-      {
-         autoload_logf("CHEATS        : skip out-of-range addr 0x%04lx (must be 0x0000-0x07FF)",
-                       addr_l);
-         continue;
-      }
-      if (val_l < 0 || val_l > 0xFF)
-      {
-         autoload_logf("CHEATS        : skip out-of-range val 0x%lx (must be 0x00-0xFF)",
-                       val_l);
-         continue;
-      }
-
-      cheats_list[cheats_count].addr     = (uint16_t)addr_l;
-      cheats_list[cheats_count].val      = (uint8_t)val_l;
-      cheats_list[cheats_count].is_const = is_const;
-      cheats_count++;
-      loaded++;
-
-      autoload_logf("CHEATS        : loaded [%s] 0x%04x = 0x%02x",
-                    is_const ? "const " : "oneshot",
-                    (unsigned)addr_l, (unsigned)val_l);
    }
 
    fclose(fp);
    return loaded;
 }
 
-/* Apply all const cheats to RAM[]. Called every frame when
- * cheats_const_enabled is true. */
+/* ---- Apply const cheats to RAM[] (called every frame) ---------------- */
 static void cheats_apply_const(void)
 {
    int i;
-   int applied = 0;
    for (i = 0; i < cheats_count; i++)
-   {
       if (cheats_list[i].is_const)
-      {
          RAM[cheats_list[i].addr] = cheats_list[i].val;
-         applied++;
-      }
-   }
-   if (applied > 0)
-   {
-      /* debug-rate log only, to avoid spamming the file */
-      /* autoload_logf("CHEATS        : applied %d const cheats", applied); */
-   }
 }
 
-/* Apply all oneshot cheats to RAM[]. Called exactly once per Num2 press. */
+/* ---- Apply oneshot cheats to RAM[] (called once per Num2 press) ------ */
 static void cheats_apply_oneshot(void)
 {
    int i;
@@ -3940,28 +4009,82 @@ static void cheats_apply_oneshot(void)
    autoload_logf("CHEATS        : Num2 pressed, applied %d oneshot cheats", applied);
 }
 
-/* Re-read the .cfg if needed. Called from retro_run(). */
+/* ---- Apply [auto] cheats once at ROM load ---------------------------- *
+ * For [auto] cheats that are also [const], the per-frame writes handle
+ * sticking the value; this function only handles the "apply once" semantics
+ * for [auto] cheats that are NOT [const]. (Const+auto cheats get the first
+ * write on the next frame via cheats_apply_const.) However, we still apply
+ * them here too, so the value is visible on the very first frame before the
+ * const writer has a chance to run. */
+static void cheats_apply_auto(void)
+{
+   int i;
+   int applied = 0;
+   for (i = 0; i < cheats_count; i++)
+   {
+      if (cheats_list[i].is_auto)
+      {
+         RAM[cheats_list[i].addr] = cheats_list[i].val;
+         applied++;
+      }
+   }
+   autoload_logf("CHEATS        : auto-applied %d [auto] cheat(s) on ROM load", applied);
+}
+
+/* ---- Re-read everything if a new ROM was loaded ---------------------- *
+ * Called from retro_run(). On first call (or after a new ROM load):
+ *   1. Read cheats_path = ... lines from the core's main .cfg
+ *   2. Find <rom-basename>.cfg in the first matching cheats_path
+ *   3. Parse it into cheats_list[]
+ *   4. Apply all [auto] cheats immediately
+ * If no cheats_path is configured, or no per-ROM .cfg file is found,
+ * cheats_count is set to 0 and the subsystem is a no-op. */
 static void cheats_maybe_reload(void)
 {
-   char cfg_path[AUTOLOAD_MAX_PATH];
+   char core_cfg[AUTOLOAD_MAX_PATH];
+   char rom_cfg[AUTOLOAD_MAX_PATH];
+   int  loaded;
+
    if (!cheats_pending_reload)
       return;
    cheats_pending_reload = false;
 
-   autoload_get_self_cfg(cfg_path, sizeof(cfg_path));
-   if (cfg_path[0] == '\0')
+   /* 1. locate the core's main .cfg */
+   autoload_get_self_cfg(core_cfg, sizeof(core_cfg));
+   if (core_cfg[0] == '\0')
    {
       autoload_logf("CHEATS        : could not locate core .cfg, cheats disabled");
       return;
    }
 
+   /* 2. read cheats_path entries */
+   cheats_read_paths_from_cfg(core_cfg);
+   if (cheats_paths_count == 0)
    {
-      int n = cheats_load_from_cfg(cfg_path);
-      if (n < 0)
-         autoload_logf("CHEATS        : no .cfg found, no cheats loaded");
-      else
-         autoload_logf("CHEATS        : %d cheat(s) loaded from %s", n, cfg_path);
+      autoload_logf("CHEATS        : no 'cheats_path' in %s, cheats disabled", core_cfg);
+      return;
    }
+
+   /* 3. find <rom-basename>.cfg */
+   if (!cheats_find_rom_cfg(rom_cfg, sizeof(rom_cfg)))
+   {
+      autoload_logf("CHEATS        : no per-ROM .cfg found for '%s'",
+                    autoload_rom_path[0] ? autoload_rom_path : "(no rom)");
+      return;
+   }
+
+   /* 4. parse it */
+   loaded = cheats_load_for_rom(rom_cfg);
+   if (loaded < 0)
+   {
+      autoload_logf("CHEATS        : could not read %s", rom_cfg);
+      return;
+   }
+   autoload_logf("CHEATS        : %d cheat(s) loaded from %s", loaded, rom_cfg);
+
+   /* 5. apply [auto] cheats immediately */
+   if (loaded > 0)
+      cheats_apply_auto();
 }
 
 void retro_run(void)
@@ -3976,7 +4099,7 @@ void retro_run(void)
       autoload_try_load_state();
    }
 
-   /* ---- Cheats: re-read .cfg if a new ROM was loaded ---- */
+   /* ---- Cheats: re-read per-ROM .cfg if a new ROM was loaded ---- */
    cheats_maybe_reload();
 
    /* ---- Hotkey: Numpad 1 -> reset game + autoload save state ---- */
@@ -4859,7 +4982,7 @@ bool retro_load_game(const struct retro_game_info *info)
    }
    autoload_state_pending = true;
 
-   /* Force re-read of the cheats section of the .cfg for this ROM. */
+   /* Force re-read of the per-ROM cheats .cfg for this ROM. */
    cheats_pending_reload = true;
 
    return true;

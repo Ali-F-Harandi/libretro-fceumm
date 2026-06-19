@@ -3317,9 +3317,25 @@ static void retro_run_blit(uint8_t *gfx)
 
 static bool autoload_state_pending      = false;
 static bool autoload_hotkey_pending     = false;  /* Num1 pressed → reset + autoload */
+static bool autoload_loadstate_pending  = false;  /* Num3 pressed → load without reset */
 static char autoload_dir[AUTOLOAD_MAX_PATH]      = {0};   /* folder the core lives in */
 static char autoload_rom_path[AUTOLOAD_MAX_PATH] = {0};   /* full path of the loaded ROM   */
 static char autoload_core_name[64]      = {0};   /* this core's file name, no ext */
+
+/* ---- Phase 2: slow-motion (Num4/5/6) ---- */
+static int  slowmo_divisor = 0;   /* 0 = off, 2 = 1/2, 4 = 1/4, 8 = 1/8 */
+static unsigned slowmo_frame_counter = 0;
+
+/* ---- Phase 2: multi-slot persistence (Num7/8) ---- */
+/* The current slot is remembered across frames so Num1/Num3 load from
+ * the same slot the user selected. autoload_read_config() resets it to 0
+ * when re-reading the config (Num9). */
+static int autoload_current_slot = 0;
+static int autoload_num_slots    = 1;
+static char autoload_slot_exts[16][64];
+
+/* ---- Phase 2: reload config flag (Num9) ---- */
+static bool autoload_config_pending_reload = false;
 
 /* Directory that THIS core (.dll/.so) lives in. */
 static void autoload_get_self_dir(char *out, size_t out_size)
@@ -3481,7 +3497,11 @@ typedef struct
    bool enabled;
    int  num_paths;
    char save_paths[AUTOLOAD_MAX_PATHS][AUTOLOAD_MAX_PATH];
-   char state_ext[64];
+   /* Multi-slot: each state_ext is one slot. Num7/Num8 cycle through them.
+    * Backward compat: if only one state_ext is set, behavior is unchanged. */
+   int  num_state_exts;
+   char state_exts[16][64];
+   int  current_slot;       /* index into state_exts[] */
 } autoload_config;
 
 static void autoload_trim(char *s)
@@ -3501,9 +3521,13 @@ static bool autoload_read_config(const char *cfg_path, autoload_config *cfg)
    FILE *fp;
    char  line[1024];
 
-   cfg->enabled      = false;
-   cfg->num_paths    = 0;
-   strcpy(cfg->state_ext, "state.auto");   /* default extension */
+   cfg->enabled        = false;
+   cfg->num_paths      = 0;
+   cfg->num_state_exts = 0;
+   cfg->current_slot   = 0;
+   /* default slot 0 extension */
+   strcpy(cfg->state_exts[0], "state.auto");
+   cfg->num_state_exts = 1;
 
    fp = fopen(cfg_path, "r");
    if (!fp)
@@ -3540,10 +3564,22 @@ static bool autoload_read_config(const char *cfg_path, autoload_config *cfg)
       else if (AUTOLOAD_STRCASECMP(key, "state_ext") == 0)
       {
          if (*val == '.') val++;            /* accept "state" or ".state" */
-         if (*val)
+         if (*val && cfg->num_state_exts < 16)
          {
-            strncpy(cfg->state_ext, val, sizeof(cfg->state_ext) - 1);
-            cfg->state_ext[sizeof(cfg->state_ext) - 1] = '\0';
+            /* First state_ext replaces the default; subsequent ones add slots */
+            if (cfg->num_state_exts == 1 &&
+                strcmp(cfg->state_exts[0], "state.auto") == 0)
+            {
+               strncpy(cfg->state_exts[0], val, sizeof(cfg->state_exts[0]) - 1);
+               cfg->state_exts[0][sizeof(cfg->state_exts[0]) - 1] = '\0';
+            }
+            else
+            {
+               strncpy(cfg->state_exts[cfg->num_state_exts], val,
+                       sizeof(cfg->state_exts[0]) - 1);
+               cfg->state_exts[cfg->num_state_exts][sizeof(cfg->state_exts[0]) - 1] = '\0';
+               cfg->num_state_exts++;
+            }
          }
       }
    }
@@ -3652,6 +3688,15 @@ static void autoload_try_load_state(void)
       return;
    }
 
+   /* Persist slot info so Num7/Num8 can change it across frames.
+    * On a fresh read, cfg.current_slot is 0; if autoload_current_slot
+    * is in range (set by a previous Num7/Num8), keep it. */
+   autoload_num_slots = cfg.num_state_exts;
+   memcpy(autoload_slot_exts, cfg.state_exts, sizeof(autoload_slot_exts));
+   if (autoload_current_slot >= autoload_num_slots)
+      autoload_current_slot = 0;
+   cfg.current_slot = autoload_current_slot;
+
    if (!cfg.enabled)
    {
       autoload_logf("RESULT        : disabled in config (enabled=0)");
@@ -3673,7 +3718,9 @@ static void autoload_try_load_state(void)
    autoload_rom_basename(romname, sizeof(romname));
    autoload_logf("rom path      : %s", autoload_rom_path);
    autoload_logf("rom name      : %s", romname);
-   autoload_logf("state ext     : %s", cfg.state_ext);
+   autoload_logf("state ext     : %s (slot %d/%d)",
+                 cfg.state_exts[cfg.current_slot],
+                 cfg.current_slot + 1, cfg.num_state_exts);
    autoload_logf("core expects  : %u bytes", (unsigned)expected);
 
    /* Try each save_path in order; the first folder that has a matching
@@ -3689,7 +3736,7 @@ static void autoload_try_load_state(void)
                 (sp[plen-1] == '\\' || sp[plen-1] == '/'))
             sp[plen-1] = '\0';
 
-         snprintf(file, sizeof(file), "%s%c%s.%s", sp, AUTOLOAD_PATH_SEP, romname, cfg.state_ext);
+         snprintf(file, sizeof(file), "%s%c%s.%s", sp, AUTOLOAD_PATH_SEP, romname, cfg.state_exts[cfg.current_slot]);
          autoload_logf("trying        : %s", file);
 
          if (filestream_read_file(file, &buf, &len))
@@ -4102,6 +4149,36 @@ void retro_run(void)
    /* ---- Cheats: re-read per-ROM .cfg if a new ROM was loaded ---- */
    cheats_maybe_reload();
 
+   /* ---- Num3: load save state WITHOUT reset (like RetroArch Load State) ---- */
+   if (autoload_loadstate_pending)
+   {
+      autoload_loadstate_pending = false;
+      autoload_logf("LOADSTATE      : Num3 pressed - loading slot %d/%d (%s) without reset",
+                    autoload_current_slot + 1, autoload_num_slots,
+                    autoload_num_slots > 0 ? autoload_slot_exts[autoload_current_slot] : "?");
+      autoload_try_load_state();
+      /* autoload_try_load_state logs its own RESULT line */
+   }
+
+   /* ---- Slow-motion: skip this frame if divisor is set and counter
+    *      says we should skip. We still blit the previous frame so the
+    *      user sees a frozen image on skipped frames (same as RetroArch). ---- */
+   if (slowmo_divisor > 0)
+   {
+      slowmo_frame_counter++;
+      if ((slowmo_frame_counter % slowmo_divisor) != 0)
+      {
+         /* Skip this frame: don't call FCEUI_Emulate, just re-blit the
+          * previous gfx buffer. We get the previous buffer by NOT
+          * updating gfx pointer — but FCEUI_Emulate is what fills it.
+          * So we just return early without audio/video. This effectively
+          * pauses the emulator for that frame.
+          * TODO: a cleaner implementation would keep the last gfx buffer. */
+         retro_run_blit(gfx);
+         return;
+      }
+   }
+
    /* ---- Hotkey: Numpad 1 -> reset game + autoload save state ---- */
    if (autoload_hotkey_pending)
    {
@@ -4140,6 +4217,112 @@ void retro_run(void)
                        cheats_const_enabled ? "ENABLED" : "DISABLED");
       }
       num0_was_pressed = num0_is_pressed;
+   }
+
+   /* ---- Hotkey: Numpad 3 -> load save state WITHOUT reset ---- */
+   {
+      static bool num3_was_pressed = false;
+      bool num3_is_pressed = input_cb(0, RETRO_DEVICE_KEYBOARD, 0, RETROK_KP3);
+      if (num3_is_pressed && !num3_was_pressed && autoload_rom_path[0] != '\0')
+         autoload_loadstate_pending = true;
+      num3_was_pressed = num3_is_pressed;
+   }
+
+   /* ---- Hotkey: Numpad 4 -> slow-motion 1/2 speed (toggle) ---- */
+   {
+      static bool num4_was_pressed = false;
+      bool num4_is_pressed = input_cb(0, RETRO_DEVICE_KEYBOARD, 0, RETROK_KP4);
+      if (num4_is_pressed && !num4_was_pressed)
+      {
+         slowmo_divisor = (slowmo_divisor == 2) ? 0 : 2;
+         autoload_logf("SLOWMO         : Num4 pressed - 1/2 speed %s",
+                       slowmo_divisor ? "ENABLED" : "DISABLED");
+      }
+      num4_was_pressed = num4_is_pressed;
+   }
+
+   /* ---- Hotkey: Numpad 5 -> slow-motion 1/4 speed (toggle) ---- */
+   {
+      static bool num5_was_pressed = false;
+      bool num5_is_pressed = input_cb(0, RETRO_DEVICE_KEYBOARD, 0, RETROK_KP5);
+      if (num5_is_pressed && !num5_was_pressed)
+      {
+         slowmo_divisor = (slowmo_divisor == 4) ? 0 : 4;
+         autoload_logf("SLOWMO         : Num5 pressed - 1/4 speed %s",
+                       slowmo_divisor ? "ENABLED" : "DISABLED");
+      }
+      num5_was_pressed = num5_is_pressed;
+   }
+
+   /* ---- Hotkey: Numpad 6 -> slow-motion 1/8 speed (toggle) ---- */
+   {
+      static bool num6_was_pressed = false;
+      bool num6_is_pressed = input_cb(0, RETRO_DEVICE_KEYBOARD, 0, RETROK_KP6);
+      if (num6_is_pressed && !num6_was_pressed)
+      {
+         slowmo_divisor = (slowmo_divisor == 8) ? 0 : 8;
+         autoload_logf("SLOWMO         : Num6 pressed - 1/8 speed %s",
+                       slowmo_divisor ? "ENABLED" : "DISABLED");
+      }
+      num6_was_pressed = num6_is_pressed;
+   }
+
+   /* ---- Hotkey: Numpad 7 -> previous save state slot ---- */
+   {
+      static bool num7_was_pressed = false;
+      bool num7_is_pressed = input_cb(0, RETRO_DEVICE_KEYBOARD, 0, RETROK_KP7);
+      if (num7_is_pressed && !num7_was_pressed)
+      {
+         if (autoload_num_slots > 1)
+         {
+            autoload_current_slot--;
+            if (autoload_current_slot < 0)
+               autoload_current_slot = autoload_num_slots - 1;
+            autoload_logf("SLOT           : %d/%d (%s) [prev]",
+                          autoload_current_slot + 1, autoload_num_slots,
+                          autoload_slot_exts[autoload_current_slot]);
+         }
+         else
+            autoload_logf("SLOT           : only 1 slot defined - Num7 has no effect");
+      }
+      num7_was_pressed = num7_is_pressed;
+   }
+
+   /* ---- Hotkey: Numpad 8 -> next save state slot ---- */
+   {
+      static bool num8_was_pressed = false;
+      bool num8_is_pressed = input_cb(0, RETRO_DEVICE_KEYBOARD, 0, RETROK_KP8);
+      if (num8_is_pressed && !num8_was_pressed)
+      {
+         if (autoload_num_slots > 1)
+         {
+            autoload_current_slot++;
+            if (autoload_current_slot >= autoload_num_slots)
+               autoload_current_slot = 0;
+            autoload_logf("SLOT           : %d/%d (%s) [next]",
+                          autoload_current_slot + 1, autoload_num_slots,
+                          autoload_slot_exts[autoload_current_slot]);
+         }
+         else
+            autoload_logf("SLOT           : only 1 slot defined - Num8 has no effect");
+      }
+      num8_was_pressed = num8_is_pressed;
+   }
+
+   /* ---- Hotkey: Numpad 9 -> reload config + cheats ---- */
+   {
+      static bool num9_was_pressed = false;
+      bool num9_is_pressed = input_cb(0, RETRO_DEVICE_KEYBOARD, 0, RETROK_KP9);
+      if (num9_is_pressed && !num9_was_pressed)
+      {
+         autoload_logf("CONFIG         : Num9 pressed - reloading config and cheats");
+         /* Reset slot to 0 so the reload picks up any new state_ext lines */
+         autoload_current_slot = 0;
+         autoload_config_pending_reload = true;
+         autoload_state_pending = true;       /* re-trigger autoload_try_load_state */
+         cheats_pending_reload = true;        /* re-trigger cheats reload */
+      }
+      num9_was_pressed = num9_is_pressed;
    }
 
    if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE_UPDATE, &updated) && updated)
@@ -4984,6 +5167,10 @@ bool retro_load_game(const struct retro_game_info *info)
 
    /* Force re-read of the per-ROM cheats .cfg for this ROM. */
    cheats_pending_reload = true;
+
+   /* Reset slot to 0 for a new ROM (Num7/Num8 may have changed it). */
+   autoload_current_slot = 0;
+   autoload_num_slots    = 1;
 
    return true;
 }

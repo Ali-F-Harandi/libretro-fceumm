@@ -3321,11 +3321,6 @@ static bool autoload_loadstate_pending  = false;  /* Num3 pressed → load witho
 static char autoload_dir[AUTOLOAD_MAX_PATH]      = {0};   /* folder the core lives in */
 static char autoload_rom_path[AUTOLOAD_MAX_PATH] = {0};   /* full path of the loaded ROM   */
 static char autoload_core_name[64]      = {0};   /* this core's file name, no ext */
-
-/* ---- Phase 2: slow-motion (Num4/5/6) ---- */
-static int  slowmo_divisor = 0;   /* 0 = off, 2 = 1/2, 4 = 1/4, 8 = 1/8 */
-static unsigned slowmo_frame_counter = 0;
-
 /* ---- Phase 2: multi-slot persistence (Num7/8) ---- */
 /* The current slot is remembered across frames so Num1/Num3 load from
  * the same slot the user selected. autoload_read_config() resets it to 0
@@ -4160,25 +4155,6 @@ void retro_run(void)
       /* autoload_try_load_state logs its own RESULT line */
    }
 
-   /* ---- Slow-motion: skip this frame if divisor is set and counter
-    *      says we should skip. We still blit the previous frame so the
-    *      user sees a frozen image on skipped frames (same as RetroArch). ---- */
-   if (slowmo_divisor > 0)
-   {
-      slowmo_frame_counter++;
-      if ((slowmo_frame_counter % slowmo_divisor) != 0)
-      {
-         /* Skip this frame: don't call FCEUI_Emulate, just re-blit the
-          * previous gfx buffer. We get the previous buffer by NOT
-          * updating gfx pointer — but FCEUI_Emulate is what fills it.
-          * So we just return early without audio/video. This effectively
-          * pauses the emulator for that frame.
-          * TODO: a cleaner implementation would keep the last gfx buffer. */
-         retro_run_blit(gfx);
-         return;
-      }
-   }
-
    /* ---- Hotkey: Numpad 1 -> reset game + autoload save state ---- */
    if (autoload_hotkey_pending)
    {
@@ -4226,45 +4202,6 @@ void retro_run(void)
       if (num3_is_pressed && !num3_was_pressed && autoload_rom_path[0] != '\0')
          autoload_loadstate_pending = true;
       num3_was_pressed = num3_is_pressed;
-   }
-
-   /* ---- Hotkey: Numpad 4 -> slow-motion 1/2 speed (toggle) ---- */
-   {
-      static bool num4_was_pressed = false;
-      bool num4_is_pressed = input_cb(0, RETRO_DEVICE_KEYBOARD, 0, RETROK_KP4);
-      if (num4_is_pressed && !num4_was_pressed)
-      {
-         slowmo_divisor = (slowmo_divisor == 2) ? 0 : 2;
-         autoload_logf("SLOWMO         : Num4 pressed - 1/2 speed %s",
-                       slowmo_divisor ? "ENABLED" : "DISABLED");
-      }
-      num4_was_pressed = num4_is_pressed;
-   }
-
-   /* ---- Hotkey: Numpad 5 -> slow-motion 1/4 speed (toggle) ---- */
-   {
-      static bool num5_was_pressed = false;
-      bool num5_is_pressed = input_cb(0, RETRO_DEVICE_KEYBOARD, 0, RETROK_KP5);
-      if (num5_is_pressed && !num5_was_pressed)
-      {
-         slowmo_divisor = (slowmo_divisor == 4) ? 0 : 4;
-         autoload_logf("SLOWMO         : Num5 pressed - 1/4 speed %s",
-                       slowmo_divisor ? "ENABLED" : "DISABLED");
-      }
-      num5_was_pressed = num5_is_pressed;
-   }
-
-   /* ---- Hotkey: Numpad 6 -> slow-motion 1/8 speed (toggle) ---- */
-   {
-      static bool num6_was_pressed = false;
-      bool num6_is_pressed = input_cb(0, RETRO_DEVICE_KEYBOARD, 0, RETROK_KP6);
-      if (num6_is_pressed && !num6_was_pressed)
-      {
-         slowmo_divisor = (slowmo_divisor == 8) ? 0 : 8;
-         autoload_logf("SLOWMO         : Num6 pressed - 1/8 speed %s",
-                       slowmo_divisor ? "ENABLED" : "DISABLED");
-      }
-      num6_was_pressed = num6_is_pressed;
    }
 
    /* ---- Hotkey: Numpad 7 -> previous save state slot ---- */
